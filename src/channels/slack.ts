@@ -37,6 +37,7 @@ export class SlackChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
+  private pendingThreadTs = new Map<string, string>();
 
   private opts: SlackChannelOpts;
 
@@ -79,10 +80,6 @@ export class SlackChannel implements Channel {
 
       if (!msg.text) return;
 
-      // Threaded replies are flattened into the channel conversation.
-      // The agent sees them alongside channel-level messages; responses
-      // always go to the channel, not back into the thread.
-
       const jid = `slack:${msg.channel}`;
       const timestamp = new Date(parseFloat(msg.ts) * 1000).toISOString();
       const isGroup = msg.channel_type !== 'im';
@@ -96,6 +93,14 @@ export class SlackChannel implements Channel {
 
       const isBotMessage =
         !!msg.bot_id || msg.user === this.botUserId;
+
+      // Track thread context for replies (only from human messages).
+      // Responses will be sent as a thread off the triggering message,
+      // or into the same thread if the message was already threaded.
+      if (!isBotMessage) {
+        const threadTs = (msg as GenericMessageEvent).thread_ts;
+        this.pendingThreadTs.set(msg.channel, threadTs ?? msg.ts);
+      }
 
       let senderName: string;
       if (isBotMessage) {
@@ -170,14 +175,18 @@ export class SlackChannel implements Channel {
     }
 
     try {
+      const threadTs = this.pendingThreadTs.get(channelId);
+      const threadOpt = threadTs ? { thread_ts: threadTs } : {};
+
       // Slack limits messages to ~4000 characters; split if needed
       if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text });
+        await this.app.client.chat.postMessage({ channel: channelId, text, ...threadOpt });
       } else {
         for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
           await this.app.client.chat.postMessage({
             channel: channelId,
             text: text.slice(i, i + MAX_MESSAGE_LENGTH),
+            ...threadOpt,
           });
         }
       }
